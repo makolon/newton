@@ -126,6 +126,11 @@ Supported Features
 .. experimental::
     :class:`~newton.solvers.SolverVBD`'s public API and behavior may change without prior notice.
 
+.. experimental::
+    :class:`~newton.solvers.SolverBoundaryImpulse` is a proof-of-concept for coupling a
+    reduced-coordinate subsystem to a maximal-coordinate subsystem through a rigid 6D
+    boundary impulse; its public API and behavior may change without prior notice.
+
 .. _Joint feature support:
 
 Joint Feature Support
@@ -425,6 +430,7 @@ See the `DiffSim examples on GitHub`_ for the current reference workflows.
    :nosignatures:
 
    SolverBase
+   SolverBoundaryImpulse
    SolverFeatherstone
    SolverImplicitMPM
    SolverKamino
