@@ -190,6 +190,13 @@ class _FullConfig:
         else:
             self._substep()
 
+    def warm(self, n_steps):
+        # Advance the real (uncaptured) simulation to steady state before capture,
+        # so the captured graph and the reported quality both reflect the held pose.
+        for _ in range(n_steps):
+            self._substep()
+        wp.synchronize()
+
     def run(self, n_steps):
         wp.synchronize()
         t0 = time.perf_counter()
@@ -263,6 +270,8 @@ class _HybridConfig:
             "dofs": self.arm_model.joint_dof_count + self.grip_model.joint_dof_count,
         }
 
+        self.graph = None
+
     def _substep(self):
         self.grip_0.clear_forces()
         self.solver.step(self.arm_0, self.arm_1, self.grip_0, self.grip_1, self.arm_ctrl, self.grip_ctrl, self.dt)
@@ -270,42 +279,57 @@ class _HybridConfig:
         self.grip_0, self.grip_1 = self.grip_1, self.grip_0
 
     def capture(self):
-        # The boundary solve runs on the host (numpy), so the coupled step cannot
-        # be CUDA-graph captured. This is a known limitation of the PoC.
-        self.graph = None
+        # The boundary solve runs entirely on-device (Warp kernels, no host
+        # round-trips), so the coupled step is CUDA-graph capturable just like
+        # the FULL configs. The rigid weld is captured on the first (warmup)
+        # step, so by capture time the step contains no first-step branch.
+        if self.device.startswith("cuda"):
+            with wp.ScopedCapture() as cap:
+                self._substep()
+            self.graph = cap.graph
+
+    def _one(self):
+        if self.graph is not None:
+            wp.capture_launch(self.graph)
+        else:
+            self._substep()
+
+    def warm(self, n_steps):
+        for _ in range(n_steps):
+            self._substep()
+        wp.synchronize()
 
     def run(self, n_steps):
         wp.synchronize()
         t0 = time.perf_counter()
         for _ in range(n_steps):
-            self._substep()
+            self._one()
         wp.synchronize()
         return time.perf_counter() - t0
 
     def breakdown(self, n_steps):
         """Per-component ms/step: reduced arm solve, maximal gripper solve.
 
-        The remainder of the full hybrid step time is the host-side boundary
-        coupling (eval_jacobian / eval_mass_matrix + the NumPy 6x6 solve + the
-        GPU<->CPU array transfers). Run after timing; it perturbs state.
+        Each sub-step is timed under its own CUDA graph (matching the captured
+        full step), so the numbers are comparable to the coupled total. The
+        remainder is the on-device boundary coupling (eval_jacobian /
+        eval_mass_matrix + the 6x6 Schur solve kernels). Run after timing; it
+        perturbs state.
         """
-        wp.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(n_steps):
+
+        def arm_sub():
             self.arm_solver.step(self.arm_0, self.arm_1, self.arm_ctrl, None, self.dt)
             self.arm_0, self.arm_1 = self.arm_1, self.arm_0
-        wp.synchronize()
-        t_arm = 1e3 * (time.perf_counter() - t0) / n_steps
 
-        wp.synchronize()
-        t0 = time.perf_counter()
-        for _ in range(n_steps):
+        def grip_sub():
             self.grip_0.clear_forces()
             self.grip_solver.step(self.grip_0, self.grip_1, self.grip_ctrl, None, self.dt)
             self.grip_0, self.grip_1 = self.grip_1, self.grip_0
-        wp.synchronize()
-        t_grip = 1e3 * (time.perf_counter() - t0) / n_steps
-        return {"arm_step": t_arm, "gripper_step": t_grip}
+
+        return {
+            "arm_step": _capture_time(arm_sub, n_steps, self.device),
+            "gripper_step": _capture_time(grip_sub, n_steps, self.device),
+        }
 
     def quality(self):
         return {
@@ -316,6 +340,29 @@ class _HybridConfig:
             "boundary_pose_err": float(np.linalg.norm(self.solver.boundary_pose_error)),
             "boundary_vel_err": float(np.linalg.norm(self.solver.boundary_velocity_error_post)),
         }
+
+
+def _capture_time(thunk, n_steps, device):
+    """Wall-clock ms/step of ``thunk`` replayed from a CUDA graph (CPU: direct)."""
+    if device.startswith("cuda"):
+        for _ in range(3):
+            thunk()  # warm + force module load before capture
+        wp.synchronize()
+        with wp.ScopedCapture() as cap:
+            thunk()
+        graph = cap.graph
+        wp.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(n_steps):
+            wp.capture_launch(graph)
+        wp.synchronize()
+        return 1e3 * (time.perf_counter() - t0) / n_steps
+    wp.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(n_steps):
+        thunk()
+    wp.synchronize()
+    return 1e3 * (time.perf_counter() - t0) / n_steps
 
 
 def run_benchmark(device, dt, warmup, timed, configs):
@@ -337,8 +384,8 @@ def run_benchmark(device, dt, warmup, timed, configs):
             else:
                 cfg = _HybridConfig(device, dt)
 
-            cfg.capture()
-            cfg.run(warmup)  # warmup: JIT + reach steady state (discarded)
+            cfg.warm(warmup)  # advance the real sim to steady state (JIT + warm, uncaptured)
+            cfg.capture()  # capture the held steady state into a CUDA graph
             elapsed = cfg.run(timed)
             ms = 1e3 * elapsed / timed
             q = cfg.quality()
@@ -383,11 +430,11 @@ def _print_table(results, dt):
             )
             if "FULL-KAMINO" in results and "ms_per_step" in results["FULL-KAMINO"]:
                 full_k = results["FULL-KAMINO"]["ms_per_step"]
-                ratio = bd["gripper_step"] / full_k
+                ratio = full_k / h["ms_per_step"] if h["ms_per_step"] > 0.0 else float("nan")
                 print(
-                    f"  -> gripper-only Kamino ({bd['gripper_step']:.1f} ms) is {ratio:.1f}x the full-system Kamino "
-                    f"({full_k:.1f} ms): isolating the maximal subsystem did NOT reduce its per-step cost. The arm "
-                    f"(Featherstone) and host coupling are cheap; Kamino's gripper solve dominates the hybrid."
+                    f"  -> all three configs are CUDA-graph captured. The hybrid's cost is the captured "
+                    f"gripper(Kamino) solve ({bd['gripper_step']:.1f} ms); the Featherstone arm and the on-device "
+                    f"boundary coupling are cheap. Hybrid is {ratio:.1f}x full-system Kamino ({full_k:.1f} ms)."
                 )
     print("=" * 78)
 

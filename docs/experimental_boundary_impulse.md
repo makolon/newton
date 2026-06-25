@@ -127,8 +127,12 @@ handled *inside* each subsystem's own solver, untouched.
   construction time, so the two subsystems need not be co-located.
 * **No contacts** between the two subsystems in the PoC (each subsystem still runs
   its own internal contacts/collisions if configured).
-* **Host-side 6×6 solve.** The coupling linear algebra is done in NumPy on the
-  host each step. This is intentionally readable, not fast.
+* **On-device 6×6 solve.** The coupling linear algebra (a 6×6 Schur solve plus an
+  `ndof` Cholesky of the reduced mass matrix) runs in a single Warp kernel, so the
+  coupled step performs no host round-trips and can be CUDA-graph captured together
+  with the two child solvers. This is what makes the staggered scheme competitive:
+  an un-captured step forces each child solver onto its slow host-synchronized
+  iteration path (§12).
 
 ## 7. Mathematical formulation
 
@@ -253,7 +257,6 @@ master/slave copy. The distinction is the whole point of the solver.
   advance, the maximal side before its advance — an O(dt) staggering artifact.
 * **Multiple** boundaries, multiple subsystems, or a boundary that is itself a
   compliant/contact interface.
-* **Warp-kernel** assembly of the boundary system (it is host NumPy for clarity).
 * A **dynamic grasp** on the real robot. The Franka + 2F-85 benchmark (§12) runs
   a *static hold*; driving the gripper closed consistently across all three
   solvers is left as future work.
@@ -303,47 +306,69 @@ closed loop, so it would silently simulate a different, open-chain robot — whi
 is exactly *why* a hybrid is needed to pair a reduced arm with a closed-chain
 gripper.)
 
-### Measured results (NVIDIA TITAN RTX, 120 timed steps after warm-up)
+### Measured results (NVIDIA TITAN RTX, 200 timed steps after warm-up)
+
+All three configs are **CUDA-graph captured** (the boundary coupling now runs
+on-device, so the hybrid step captures just like the two baselines — a
+prerequisite for a fair comparison; see below).
 
 | Config | ms / step | bodies | weld pose error | stable |
 |---|---:|---:|---:|:--:|
-| FULL-MUJOCO | **0.66** | 24 | — | ✓ |
-| FULL-KAMINO | 27.3 | 24 | — | ✓ |
-| HYBRID | 117.7 | 24 | 3.4·10⁻⁴ m | ✓ |
+| FULL-MUJOCO | **0.77** | 24 | — | ✓ |
+| FULL-KAMINO | 27.8 | 24 | — | ✓ |
+| HYBRID | **13.0** | 24 | 1.3·10⁻⁴ m | ✓ |
 
-HYBRID per-component breakdown [ms/step]: arm (Featherstone) **1.35**,
-gripper (Kamino, 14-body) **107.9**, host-side coupling **8.4**.
+HYBRID per-component breakdown [ms/step]: arm (Featherstone) **0.97**,
+gripper (Kamino, 14-body) **11.4**, on-device coupling **0.67**.
+
+### Why graph capture is the whole story
+
+`SolverKamino` runs its PADMM iteration to convergence with a device-side
+`wp.capture_while` loop. **Un-captured**, each iteration's residual check
+round-trips to the host, so the per-step launch + synchronization overhead
+dominates the actual compute by ~10×. **Captured**, the loop runs entirely on
+the GPU. Measured on the isolated gripper, capture turns a 150 ms/step solve into
+a 13.8 ms/step solve — a **~11× speedup with no change in the math.**
+
+The previous version of this note assembled the boundary system in NumPy on the
+host. That host code sat *inside* the coupled step, which made the whole hybrid
+step impossible to graph-capture while both *baselines were captured* — an
+apples-to-oranges comparison that made the hybrid look ~9× slower than it is.
+Moving the 6×6 Schur solve into a Warp kernel removed the only host round-trip in
+the step, so all three configs are now captured on equal footing.
 
 ### What the numbers say
 
 * **The hybrid is correct.** It is stable and holds the rigid weld between the
   reduced end-effector and the maximal gripper base to **sub-millimeter**
-  (pose error ≈ 3·10⁻⁴ m) — the coupling does what it claims.
-* **The hybrid is *not* faster.** It is the slowest of the three (≈ 4× slower
-  than full-Kamino, ≈ 180× slower than full-MuJoCo).
-* **The coupling is cheap; Kamino dominates.** The boundary layer (host NumPy +
-  GPU↔CPU transfers, no graph capture) costs only ~8 ms/step and the Featherstone
-  arm only ~1.4 ms/step. The entire hybrid cost is Kamino's gripper solve.
-* **The headline finding refutes the size hypothesis.** Kamino on the *isolated
-  14-body gripper* (107.9 ms) is **~4× more expensive** than Kamino on the *full
-  24-body* arm+gripper (27.3 ms). Splitting the maximal subsystem off did **not**
-  shrink its cost — the isolated floating-base closed chain is a harder/worse-
-  conditioned PADMM problem than the grounded full system. So the premise that a
-  hybrid wins by giving the maximal solver a *smaller* problem does not hold here.
-* **For raw speed, a single mature reduced solver wins decisively.** `SolverMuJoCo`
-  represents the same closed loop via equality constraints and is ~40× faster than
-  Kamino and ~180× faster than the hybrid.
+  (pose error ≈ 1.3·10⁻⁴ m) — the coupling does what it claims.
+* **The hybrid beats full-Kamino.** At 13.0 ms/step it is **~2.1× faster** than
+  full-Kamino (27.8 ms) on the same system.
+* **Splitting the maximal subsystem off *does* shrink its cost.** Kamino on the
+  *isolated 14-body gripper* (11.4 ms, captured) is **cheaper** than Kamino on the
+  *full 24-body* arm+gripper (27.8 ms): the hybrid gives the maximal solver a
+  smaller problem and pays only a cheap reduced-arm solve (≈ 1 ms) plus negligible
+  coupling (≈ 0.7 ms) for the rest. *(This reverses an earlier finding that was an
+  artifact of timing the gripper solve un-captured while the full system was
+  captured.)*
+* **The coupling is cheap.** The on-device boundary layer (eval_jacobian /
+  eval_mass_matrix + the 6×6 Schur solve kernels) costs only ~0.7 ms/step.
+* **For raw speed, a single mature reduced solver still wins decisively.**
+  `SolverMuJoCo` represents the same closed loop via equality constraints and is
+  ~36× faster than full-Kamino and ~17× faster than the hybrid.
 
 ### Verdict and caveats
 
-The hybrid's value on this system is **modularity and correctness**, not speed:
-it lets a reduced-coordinate arm engine that *cannot* represent loops still drive
-a true maximal-coordinate closed-chain gripper, with a faithful rigid interface.
-Any *speed* benefit would require (a) Kamino's per-step cost to drop and to scale
-down with subsystem size, and (b) the coupling moved onto the GPU (Warp kernels +
-graph capture) — though the breakdown shows the coupling is not currently the
-bottleneck. Caveats that make the comparison fair and reproducible: the Franka
-needs small **joint armature** to be stable under `SolverFeatherstone`'s
-semi-implicit integration at `dt = 1e-3` (the URDF carries none); the scenario is
-a **static hold** (a dynamic grasp is future work, §10); and all three configs
-use identical models, gains, armature, and `dt`.
+The hybrid's value on this system is **modularity and correctness** plus a real
+**speedup over the full maximal-coordinate solver**: it lets a reduced-coordinate
+arm engine that *cannot* represent loops still drive a true maximal-coordinate
+closed-chain gripper, with a faithful rigid interface, at ~2× the speed of running
+the whole robot in Kamino. It does not beat a single mature reduced solver
+(`SolverMuJoCo`) that can model the loop directly; the hybrid earns its keep only
+when the closed-chain subsystem genuinely needs a maximal-coordinate solver.
+Caveats that make the comparison fair and reproducible: all three configs are
+CUDA-graph captured after an identical uncaptured warm-up to the held steady
+state; the Franka needs small **joint armature** to be stable under
+`SolverFeatherstone`'s semi-implicit integration at `dt = 1e-3` (the URDF carries
+none); the scenario is a **static hold** (a dynamic grasp is future work, §10);
+and all three configs use identical models, gains, armature, and `dt`.

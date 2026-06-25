@@ -26,11 +26,19 @@ The reaction ``+J_r^T lambda`` is fed back to the reduced side and
 ``-J_m^T lambda`` to the maximal side, so the coupling conserves momentum across
 the seam (Newton's third law) rather than one-way copying the end-effector pose
 onto the mechanism base.
+
+The boundary system is tiny (a 6x6 Schur solve plus an ``ndof`` Cholesky of the
+reduced mass matrix). It is assembled and solved **on-device** in a single
+Warp kernel so the whole coupled :meth:`SolverBoundaryImpulse.step` contains no
+host round-trips and can be captured into a CUDA graph alongside the two child
+solvers -- the only way the staggered scheme is competitive, since an
+un-captured step forces each child solver onto its slow host-synchronized
+iteration path.
 """
 
 from __future__ import annotations
 
-import numpy as np
+import warp as wp
 
 from ...sim import Contacts, Control, State, eval_fk, eval_jacobian, eval_mass_matrix
 from ..solver import SolverBase
@@ -39,65 +47,268 @@ __all__ = ["SolverBoundaryImpulse"]
 
 
 # ---------------------------------------------------------------------------
-# Small host-side helpers. The boundary system is tiny (6x6); we assemble and
-# solve it in NumPy for readability rather than in Warp kernels. Performance is
-# explicitly not a goal of this proof-of-concept.
+# Device-side dense linear algebra. The boundary solve needs a small symmetric
+# positive-definite Cholesky factorization (the reduced mass matrix, ndof x ndof)
+# and a 6x6 Schur solve. Both run in a single thread inside the boundary kernel;
+# the problem is microscopic, so a serial host-free solve is more than fast
+# enough and -- crucially -- keeps the step graph-capturable.
 # ---------------------------------------------------------------------------
 
 
-def _quat_to_matrix(q: np.ndarray) -> np.ndarray:
-    """Rotation matrix from a Warp-convention quaternion ``(x, y, z, w)``."""
-    x, y, z, w = q
-    n = x * x + y * y + z * z + w * w
-    if n < 1.0e-12:
-        return np.eye(3)
-    s = 2.0 / n
-    return np.array(
-        [
-            [1.0 - s * (y * y + z * z), s * (x * y - z * w), s * (x * z + y * w)],
-            [s * (x * y + z * w), 1.0 - s * (x * x + z * z), s * (y * z - x * w)],
-            [s * (x * z - y * w), s * (y * z + x * w), 1.0 - s * (x * x + y * y)],
-        ]
+@wp.func
+def _chol_factor(n: int, A: wp.array2d[float], L: wp.array2d[float]):
+    """Lower-triangular Cholesky factor ``L`` of an SPD matrix ``A`` (``A = L Lᵀ``).
+
+    Only the lower triangle of ``L`` is written/read; ``A`` may be larger than
+    ``n`` (only its leading ``n x n`` block is used).
+    """
+    for j in range(n):
+        s = A[j, j]
+        for k in range(j):
+            s = s - L[j, k] * L[j, k]
+        s = wp.sqrt(s)
+        L[j, j] = s
+        inv = 1.0 / s
+        for i in range(j + 1, n):
+            t = A[i, j]
+            for k in range(j):
+                t = t - L[i, k] * L[j, k]
+            L[i, j] = t * inv
+
+
+@wp.func
+def _chol_solve(n: int, L: wp.array2d[float], b: wp.array[float], x: wp.array[float]):
+    """Solve ``L Lᵀ x = b`` in place-safe form (``x`` may alias ``b``)."""
+    # Forward substitution: L y = b.
+    for i in range(n):
+        s = b[i]
+        for k in range(i):
+            s = s - L[i, k] * x[k]
+        x[i] = s / L[i, i]
+    # Back substitution: Lᵀ x = y.
+    for ii in range(n):
+        i = n - 1 - ii
+        s = x[i]
+        for k in range(i + 1, n):
+            s = s - L[k, i] * x[k]
+        x[i] = s / L[i, i]
+
+
+@wp.func
+def _rotation_log(R: wp.mat33) -> wp.vec3:
+    """Axis-angle vector (``so(3)`` log) of a rotation matrix, in world axes."""
+    cos_theta = wp.clamp((R[0, 0] + R[1, 1] + R[2, 2] - 1.0) * 0.5, -1.0, 1.0)
+    theta = wp.acos(cos_theta)
+    axis = wp.vec3(R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1])
+    if theta < 1.0e-7:
+        # Small angle: vee(R - I) is accurate and avoids the 1/sin(theta) blow-up.
+        return axis * 0.5
+    return axis * (theta / (2.0 * wp.sin(theta)))
+
+
+@wp.kernel
+def _capture_weld_kernel(
+    ee: int,
+    base: int,
+    ee_com_local: wp.vec3,
+    base_com_local: wp.vec3,
+    body_q_red: wp.array[wp.transform],
+    body_q_max: wp.array[wp.transform],
+    # outputs
+    weld_offset: wp.array[wp.vec3],  # base-COM in EE frame
+    weld_rot: wp.array[wp.mat33],  # R_ee^T @ R_base
+):
+    """Capture the rigid weld offset from the current relative configuration."""
+    ee_tf = body_q_red[ee]
+    R_ee = wp.quat_to_matrix(wp.transform_get_rotation(ee_tf))
+    p_ee_com = wp.transform_point(ee_tf, ee_com_local)
+
+    base_tf = body_q_max[base]
+    R_base = wp.quat_to_matrix(wp.transform_get_rotation(base_tf))
+    p_base_com = wp.transform_point(base_tf, base_com_local)
+
+    weld_offset[0] = wp.transpose(R_ee) * (p_base_com - p_ee_com)
+    weld_rot[0] = wp.transpose(R_ee) * R_base
+
+
+@wp.kernel
+def _boundary_solve_kernel(
+    # layout / config
+    r0: int,
+    dof0: int,
+    ndof: int,
+    ee: int,
+    base: int,
+    dt: float,
+    beta: float,
+    reg: float,
+    maxvel: float,
+    base_inv_mass: float,
+    ee_com_local: wp.vec3,
+    base_com_local: wp.vec3,
+    base_inv_inertia_local: wp.mat33,
+    # reduced-side device state
+    J_slice: wp.array2d[float],  # articulation Jacobian rows [6*joints, dofs]
+    H_slice: wp.array2d[float],  # articulation mass matrix [dofs, dofs]
+    body_q_red: wp.array[wp.transform],
+    joint_qd: wp.array[float],
+    # maximal-side device state
+    body_q_max: wp.array[wp.transform],
+    body_qd_max: wp.array[wp.spatial_vector],
+    body_f_max: wp.array[wp.spatial_vector],
+    # cached weld
+    weld_offset: wp.array[wp.vec3],
+    weld_rot: wp.array[wp.mat33],
+    # scratch
+    Jr: wp.array2d[float],  # [6, ndof] EE-COM Jacobian transported to base COM
+    Lr: wp.array2d[float],  # [ndof, ndof] Cholesky of M_r
+    X: wp.array2d[float],  # [ndof, 6] = M_r^-1 J_r^T
+    A: wp.array2d[float],  # [6, 6] boundary inverse inertia
+    LA: wp.array2d[float],  # [6, 6] Cholesky of A
+    vrhs: wp.array[float],  # [ndof] column solve scratch
+    vec6: wp.array[float],  # [6] r_c / lambda
+    dv: wp.array[float],  # [ndof] reduced velocity correction
+    # diagnostics
+    d_pose: wp.array[float],
+    d_c0: wp.array[float],
+    d_lam: wp.array[float],
+    d_Ve: wp.array[float],
+    d_Vb: wp.array[float],
+):
+    # Single-thread solve (launched with dim=1); the boundary system is tiny.
+
+    # --- reduced/maximal boundary geometry (boundary point = maximal base COM) ---
+    ee_tf = body_q_red[ee]
+    R_ee = wp.quat_to_matrix(wp.transform_get_rotation(ee_tf))
+    p_ee_com = wp.transform_point(ee_tf, ee_com_local)
+
+    base_tf = body_q_max[base]
+    R_base = wp.quat_to_matrix(wp.transform_get_rotation(base_tf))
+    p_base_com = wp.transform_point(base_tf, base_com_local)
+
+    r = p_base_com - p_ee_com  # moment arm EE-COM -> boundary point
+
+    # Transport the reduced Jacobian from the EE COM to the boundary point:
+    # v_point = v_com + omega x r, i.e. lin' = lin - r x ang, ang' = ang.
+    for c in range(ndof):
+        lin = wp.vec3(J_slice[r0 + 0, c], J_slice[r0 + 1, c], J_slice[r0 + 2, c])
+        ang = wp.vec3(J_slice[r0 + 3, c], J_slice[r0 + 4, c], J_slice[r0 + 5, c])
+        lint = lin - wp.cross(r, ang)
+        Jr[0, c] = lint[0]
+        Jr[1, c] = lint[1]
+        Jr[2, c] = lint[2]
+        Jr[3, c] = ang[0]
+        Jr[4, c] = ang[1]
+        Jr[5, c] = ang[2]
+
+    # Reduced boundary twist V_e = J_r v_r and maximal boundary twist V_b.
+    for row in range(6):
+        s = float(0.0)
+        for c in range(ndof):
+            s = s + Jr[row, c] * joint_qd[dof0 + c]
+        d_Ve[row] = s
+    qd_b = body_qd_max[base]
+    for k in range(6):
+        d_Vb[k] = qd_b[k]
+    for k in range(6):
+        d_c0[k] = d_Ve[k] - d_Vb[k]
+
+    # Boundary pose error: deviation of the maximal base from where the reduced
+    # end-effector says it should be (world axes, at the base COM).
+    desired_p_base = p_ee_com + R_ee * weld_offset[0]
+    x_err = p_base_com - desired_p_base
+    R_des_base = R_ee * weld_rot[0]
+    rot_err = _rotation_log(R_base * wp.transpose(R_des_base))
+    d_pose[0] = x_err[0]
+    d_pose[1] = x_err[1]
+    d_pose[2] = x_err[2]
+    d_pose[3] = rot_err[0]
+    d_pose[4] = rot_err[1]
+    d_pose[5] = rot_err[2]
+
+    # r_c = c_target - c0, with the Baumgarte target +(beta/dt) e_pose on C = V_e - V_b.
+    bgain = float(0.0)
+    if beta != 0.0:
+        bgain = beta / dt
+    for k in range(6):
+        vec6[k] = bgain * d_pose[k] - d_c0[k]
+
+    # A = J_r M_r^-1 J_r^T + M_m^-1 (+ reg I).  Solve M_r X = J_r^T first.
+    _chol_factor(ndof, H_slice, Lr)
+    for c in range(6):
+        for i in range(ndof):
+            vrhs[i] = Jr[c, i]  # (J_r^T)[:, c] == row c of J_r
+        _chol_solve(ndof, Lr, vrhs, vrhs)
+        for i in range(ndof):
+            X[i, c] = vrhs[i]
+    for p in range(6):
+        for q in range(6):
+            s = float(0.0)
+            for i in range(ndof):
+                s = s + Jr[p, i] * X[i, q]
+            A[p, q] = s
+
+    # Maximal inverse spatial inertia at the base COM (world), block-diagonal.
+    # The base's free-body inertia is an intentional under-estimate (see note).
+    Iinv = R_base * base_inv_inertia_local * wp.transpose(R_base)
+    for i in range(3):
+        A[i, i] = A[i, i] + base_inv_mass
+        for j in range(3):
+            A[3 + i, 3 + j] = A[3 + i, 3 + j] + Iinv[i, j]
+    for k in range(6):
+        A[k, k] = A[k, k] + reg
+
+    # lambda = A^-1 r_c.
+    _chol_factor(6, A, LA)
+    _chol_solve(6, LA, vec6, vec6)
+
+    # Optional safety clamp for pathological steps.
+    if maxvel >= 0.0:
+        cn = float(0.0)
+        for k in range(6):
+            cn = cn + d_c0[k] * d_c0[k]
+        cn = wp.sqrt(cn)
+        if cn > maxvel:
+            f = maxvel / cn
+            for k in range(6):
+                vec6[k] = vec6[k] * f
+    for k in range(6):
+        d_lam[k] = vec6[k]
+
+    # Apply +J_r^T lambda to the reduced side as dv = M_r^-1 J_r^T lambda = X lambda.
+    for i in range(ndof):
+        s = float(0.0)
+        for q in range(6):
+            s = s + X[i, q] * vec6[q]
+        dv[i] = s
+        joint_qd[dof0 + i] = joint_qd[dof0 + i] + s
+
+    # Apply -J_m^T lambda (= -lambda, J_m = I) to the maximal side as an external
+    # wrench at the base COM (impulse / dt).
+    fb = body_f_max[base]
+    body_f_max[base] = fb + wp.spatial_vector(
+        -vec6[0] / dt, -vec6[1] / dt, -vec6[2] / dt, -vec6[3] / dt, -vec6[4] / dt, -vec6[5] / dt
     )
 
 
-def _skew(v: np.ndarray) -> np.ndarray:
-    """3x3 skew-symmetric matrix such that ``skew(v) @ w == cross(v, w)``."""
-    return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
-
-
-def _rotation_log(R: np.ndarray) -> np.ndarray:
-    """Axis-angle vector (``so(3)`` log) of a rotation matrix, in world axes."""
-    # Robust extraction of the rotation vector from a rotation matrix.
-    cos_theta = np.clip((np.trace(R) - 1.0) * 0.5, -1.0, 1.0)
-    theta = np.arccos(cos_theta)
-    if theta < 1.0e-7:
-        # Small angle: vee(R - I) is accurate and avoids the 1/sin(theta) blow-up.
-        return np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]]) * 0.5
-    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    return axis * (theta / (2.0 * np.sin(theta)))
-
-
-def _transform_point(xform: np.ndarray, local: np.ndarray) -> np.ndarray:
-    """World position of a body-local point given a ``(p, quat)`` transform (7,)."""
-    p = xform[0:3]
-    R = _quat_to_matrix(xform[3:7])
-    return p + R @ local
-
-
-def _point_transport(r: np.ndarray) -> np.ndarray:
-    """6x6 twist transport from a body COM to a point offset ``r`` (world).
-
-    Maps a COM twist ``(v_com, omega)`` to the velocity of the material point at
-    ``r = p_point - p_com``: ``v_point = v_com + omega x r``. In Newton's public
-    ``(linear, angular)`` ordering this is ``[[I, -skew(r)], [0, I]]``. Its
-    transpose performs the dual wrench transport (boundary -> COM), so building
-    the boundary Jacobians with this factor makes ``J^T`` carry the moment-arm
-    shift automatically.
-    """
-    J = np.eye(6)
-    J[0:3, 3:6] = -_skew(r)
-    return J
+@wp.kernel
+def _post_diag_kernel(
+    dof0: int,
+    ndof: int,
+    base: int,
+    Jr: wp.array2d[float],
+    joint_qd: wp.array[float],
+    body_qd_max: wp.array[wp.spatial_vector],
+    # outputs
+    d_velpost: wp.array[float],
+):
+    """Post-correction boundary velocity error V_e_post - V_b_post (diagnostic)."""
+    qd_b = body_qd_max[base]
+    for row in range(6):
+        s = float(0.0)
+        for c in range(ndof):
+            s = s + Jr[row, c] * joint_qd[dof0 + c]
+        d_velpost[row] = s - qd_b[row]
 
 
 class SolverBoundaryImpulse(SolverBase):
@@ -112,7 +323,9 @@ class SolverBoundaryImpulse(SolverBase):
     :class:`~newton.Model` objects. Each :meth:`step` advances both subsystems
     and exchanges a boundary impulse so that the reduced end-effector body and
     the maximal base body stay rigidly welded (velocity-level constraint, with
-    optional Baumgarte position stabilization).
+    optional Baumgarte position stabilization). The boundary solve runs entirely
+    on-device, so a coupled step contains no host synchronization and can be
+    CUDA-graph captured together with the two child solvers.
 
     Args:
         reduced_solver: Solver integrating the reduced-coordinate subsystem
@@ -197,27 +410,25 @@ class SolverBoundaryImpulse(SolverBase):
         # which is the stable failure mode. Choose a base body that carries
         # meaningful mass (e.g. the gripper's main `base` link, not a massless
         # mounting frame). See the design note.
-        self._base_inv_mass = float(self.maximal_model.body_inv_mass.numpy()[self.maximal_base_body])
-        self._base_inv_inertia_local = np.array(
-            self.maximal_model.body_inv_inertia.numpy()[self.maximal_base_body], dtype=np.float64
-        ).reshape(3, 3)
-        self._base_com_local = np.array(self.maximal_model.body_com.numpy()[self.maximal_base_body], dtype=np.float64)
-        self._ee_com_local = np.array(self.reduced_model.body_com.numpy()[self.reduced_ee_body], dtype=np.float64)
+        base_inv_mass = float(self.maximal_model.body_inv_mass.numpy()[self.maximal_base_body])
+        base_inv_inertia_local = self.maximal_model.body_inv_inertia.numpy()[self.maximal_base_body].reshape(3, 3)
+        base_com_local = self.maximal_model.body_com.numpy()[self.maximal_base_body]
+        ee_com_local = self.reduced_model.body_com.numpy()[self.reduced_ee_body]
+        self._base_inv_mass = base_inv_mass
+        self._base_inv_inertia_local = wp.mat33(*[float(v) for v in base_inv_inertia_local.reshape(-1)])
+        self._base_com_local = wp.vec3(*[float(v) for v in base_com_local])
+        self._ee_com_local = wp.vec3(*[float(v) for v in ee_com_local])
 
         # Rigid weld offset, captured lazily on the first step from the initial
         # relative configuration of the two subsystems (so they need not be
-        # co-located by the caller). The boundary point is the maximal base COM;
-        # we store that point in the end-effector frame at weld time.
-        self._weld_offset_in_ee: np.ndarray | None = None  # base-COM in EE frame
-        self._weld_rot_rel: np.ndarray | None = None  # R_ee^T @ R_base at weld time
+        # co-located by the caller). Stored on-device; populated before any graph
+        # capture (which only ever happens after at least one warmup step).
+        self._weld_captured = False
+        self._weld_offset = wp.zeros(1, dtype=wp.vec3, device=self.device)
+        self._weld_rot = wp.zeros(1, dtype=wp.mat33, device=self.device)
 
-        # Diagnostics from the most recent step (read by examples/tests).
-        self.boundary_pose_error: np.ndarray | None = None  # (6,) (lin, ang) world
-        self.boundary_velocity_error_pre: np.ndarray | None = None  # (6,) before correction
-        self.boundary_velocity_error_post: np.ndarray | None = None  # (6,) after correction
-        self.boundary_impulse: np.ndarray | None = None  # (6,) lambda (lin, ang) at boundary point
-        self.boundary_twist_reduced: np.ndarray | None = None  # (6,) V_e before correction
-        self.boundary_twist_maximal: np.ndarray | None = None  # (6,) V_b before maximal advance
+        self._stepped = False
+        self._alloc_scratch()
 
     # -- setup helpers ------------------------------------------------------
 
@@ -226,7 +437,7 @@ class SolverBoundaryImpulse(SolverBase):
         joint_child = self.reduced_model.joint_child.numpy()
         joint_art = self.reduced_model.joint_articulation.numpy()
         art_start = self.reduced_model.articulation_start.numpy()
-        matches = np.where(joint_child == self.reduced_ee_body)[0]
+        matches = (joint_child == self.reduced_ee_body).nonzero()[0]
         if len(matches) == 0:
             raise ValueError(
                 f"reduced_ee_body {self.reduced_ee_body} is not the child of any joint; it must be an articulated link."
@@ -237,6 +448,39 @@ class SolverBoundaryImpulse(SolverBase):
             raise ValueError(f"reduced_ee_body {self.reduced_ee_body} is not part of an articulation.")
         local = j - int(art_start[a])
         return a, 6 * local
+
+    def _alloc_scratch(self) -> None:
+        """Preallocate all device buffers so :meth:`step` allocates nothing.
+
+        Reusing eval_jacobian / eval_mass_matrix output and temp buffers (and the
+        boundary scratch) keeps the coupled step free of per-step allocation, a
+        prerequisite for CUDA-graph capture.
+        """
+        m = self.reduced_model
+        dev = self.device
+        ndof = self._reduced_ndof
+        max_links = m.max_joints_per_articulation
+        max_dofs = m.max_dofs_per_articulation
+        self._J = wp.empty((m.articulation_count, max_links * 6, max_dofs), dtype=float, device=dev)
+        self._H = wp.empty((m.articulation_count, max_dofs, max_dofs), dtype=float, device=dev)
+        self._joint_S_s = wp.zeros(m.joint_dof_count, dtype=wp.spatial_vector, device=dev)
+        self._body_I_s = wp.zeros(m.body_count, dtype=wp.spatial_matrix, device=dev)
+
+        z = lambda *shape: wp.zeros(shape, dtype=float, device=dev)  # noqa: E731
+        self._Jr = z(6, ndof)
+        self._Lr = z(ndof, ndof)
+        self._X = z(ndof, 6)
+        self._A = z(6, 6)
+        self._LA = z(6, 6)
+        self._vrhs = z(ndof)
+        self._vec6 = z(6)
+        self._dv = z(ndof)
+        self._d_pose = z(6)
+        self._d_c0 = z(6)
+        self._d_lam = z(6)
+        self._d_Ve = z(6)
+        self._d_Vb = z(6)
+        self._d_velpost = z(6)
 
     # -- the coupled step ---------------------------------------------------
 
@@ -256,7 +500,8 @@ class SolverBoundaryImpulse(SolverBase):
         The experimental multi-state signature is intentional: the two
         subsystems own separate :class:`~newton.State` objects. See the design
         note for the per-step sequence; the short version is advance-reduced,
-        solve-boundary-impulse, apply-to-both, advance-maximal.
+        solve-boundary-impulse, apply-to-both, advance-maximal. The boundary
+        solve runs on-device, so the whole step is CUDA-graph capturable.
 
         Args:
             reduced_state_in: Input state of the reduced subsystem.
@@ -271,119 +516,138 @@ class SolverBoundaryImpulse(SolverBase):
             dt: Time step [s].
             maximal_contacts: Optional contacts for the maximal subsystem.
         """
-        # 1. Advance the reduced subsystem unconstrained by the boundary. After
-        #    this, reduced_state_out carries q+, v* and the (public-convention)
-        #    body_q / body_qd of the end-effector.
+        # 1. Advance the reduced subsystem unconstrained by the boundary.
         self.reduced_solver.step(reduced_state_in, reduced_state_out, reduced_control, None, dt)
 
         # 2. Reduced-side boundary quantities. eval_* read body_q/joint_q, which
         #    the reduced solver already refreshed; we re-run FK defensively in
         #    case a child solver does not populate body_qd to the public contract.
         eval_fk(self.reduced_model, reduced_state_out.joint_q, reduced_state_out.joint_qd, reduced_state_out)
-        J_full = eval_jacobian(self.reduced_model, reduced_state_out).numpy()
-        H_full = eval_mass_matrix(self.reduced_model, reduced_state_out).numpy()
+        eval_jacobian(self.reduced_model, reduced_state_out, J=self._J, joint_S_s=self._joint_S_s)
+        eval_mass_matrix(self.reduced_model, reduced_state_out, H=self._H, J=self._J, body_I_s=self._body_I_s)
+
         a = self._reduced_art
-        r0 = self._reduced_ee_row
-        ndof = self._reduced_ndof
-        J_r_com = J_full[a, r0 : r0 + 6, 0:ndof].astype(np.float64)  # (6, ndof) at the EE COM
-        M_r = H_full[a, 0:ndof, 0:ndof].astype(np.float64)  # (ndof, ndof)
 
-        v_r = reduced_state_out.joint_qd.numpy()[self._reduced_dof0 : self._reduced_dof1].astype(np.float64)
-        ee_q = reduced_state_out.body_q.numpy()[self.reduced_ee_body].astype(np.float64)
-        p_ee_com = _transform_point(ee_q, self._ee_com_local)
-        R_ee = _quat_to_matrix(ee_q[3:7])
+        # 3. Capture the rigid weld on the first step (before any graph capture).
+        if not self._weld_captured:
+            wp.launch(
+                _capture_weld_kernel,
+                dim=1,
+                inputs=[
+                    self.reduced_ee_body,
+                    self.maximal_base_body,
+                    self._ee_com_local,
+                    self._base_com_local,
+                    reduced_state_out.body_q,
+                    maximal_state_in.body_q,
+                ],
+                outputs=[self._weld_offset, self._weld_rot],
+                device=self.device,
+            )
+            self._weld_captured = True
 
-        # 3. Maximal-side boundary quantities, read from the *input* (pre-advance)
-        #    state. We anchor the boundary frame at the maximal base COM, so the
-        #    maximal Jacobian is the identity selection (J_m = I). This is
-        #    deliberate: it keeps the base's (often tiny, e.g. a thin link)
-        #    off-axis rotational inertia from being amplified by an offset moment
-        #    arm into a spurious spin; the well-conditioned reduced arm carries
-        #    the moment-arm transport instead.
-        base_q = maximal_state_in.body_q.numpy()[self.maximal_base_body].astype(np.float64)
-        base_qd = maximal_state_in.body_qd.numpy()[self.maximal_base_body].astype(np.float64)
-        p_base_com = _transform_point(base_q, self._base_com_local)  # boundary point (world)
-        R_base = _quat_to_matrix(base_q[3:7])
+        # 4. Assemble + solve the boundary impulse on-device, apply +J_r^T lambda
+        #    to the reduced output velocity and -J_m^T lambda to the maximal input
+        #    body_f. The boundary point is anchored at the maximal base COM, so the
+        #    maximal Jacobian is the identity selection (J_m = I).
+        maxvel = -1.0 if self.config.max_velocity_error is None else float(self.config.max_velocity_error)
+        wp.launch(
+            _boundary_solve_kernel,
+            dim=1,
+            inputs=[
+                self._reduced_ee_row,
+                self._reduced_dof0,
+                self._reduced_ndof,
+                self.reduced_ee_body,
+                self.maximal_base_body,
+                float(dt),
+                float(self.config.baumgarte),
+                float(self.config.regularization),
+                maxvel,
+                self._base_inv_mass,
+                self._ee_com_local,
+                self._base_com_local,
+                self._base_inv_inertia_local,
+                self._J[a],
+                self._H[a],
+                reduced_state_out.body_q,
+                reduced_state_out.joint_qd,
+                maximal_state_in.body_q,
+                maximal_state_in.body_qd,
+                maximal_state_in.body_f,
+                self._weld_offset,
+                self._weld_rot,
+                self._Jr,
+                self._Lr,
+                self._X,
+                self._A,
+                self._LA,
+                self._vrhs,
+                self._vec6,
+                self._dv,
+                self._d_pose,
+                self._d_c0,
+                self._d_lam,
+                self._d_Ve,
+                self._d_Vb,
+            ],
+            device=self.device,
+        )
 
-        # Transport the reduced Jacobian from the EE COM to the boundary point.
-        J_r = _point_transport(p_base_com - p_ee_com) @ J_r_com  # (6, ndof)
-        V_e = J_r @ v_r  # reduced boundary twist at the base COM
-
-        J_m = np.eye(6)
-        V_b = base_qd.copy()  # maximal boundary twist (boundary point == base COM)
-
-        # Maximal inverse spatial inertia at COM (world frame), block-diagonal.
-        # Free-body inertia of the base (an intentional under-estimate; see the
-        # cached-data comment in __init__ and the design note).
-        Minv_m = np.zeros((6, 6))
-        Minv_m[0:3, 0:3] = self._base_inv_mass * np.eye(3)
-        Minv_m[3:6, 3:6] = R_base @ self._base_inv_inertia_local @ R_base.T
-
-        # Capture the rigid weld on the first step: the base COM, expressed in the
-        # current end-effector frame (so the two subsystems need not be co-located).
-        if self._weld_offset_in_ee is None:
-            self._weld_offset_in_ee = R_ee.T @ (p_base_com - p_ee_com)
-            self._weld_rot_rel = R_ee.T @ R_base
-
-        # 4. Boundary pose error: deviation of the maximal base from where the
-        #    reduced end-effector says it should be (world axes, at the base COM).
-        desired_p_base = p_ee_com + R_ee @ self._weld_offset_in_ee
-        x_err = p_base_com - desired_p_base
-        R_des_base = R_ee @ self._weld_rot_rel
-        rot_err = _rotation_log(R_base @ R_des_base.T)
-        e_pose = np.concatenate([x_err, rot_err])  # (6,) base deviation, (lin, ang)
-
-        # 5. Solve the boundary impulse (Schur complement of the KKT system).
-        #    With e_pose the base-minus-desired deviation, d/dt(e_pose) ~ V_b - V_e,
-        #    so the Baumgarte target on C = V_e - V_b is +(beta/dt) * e_pose.
-        c0 = V_e - V_b  # current boundary velocity mismatch
-        beta = self.config.baumgarte
-        c_target = (beta / dt) * e_pose if beta != 0.0 else np.zeros(6)
-        r_c = c_target - c0
-
-        Minv_r = np.linalg.inv(M_r)
-        A = J_r @ Minv_r @ J_r.T + J_m @ Minv_m @ J_m.T
-        A += self.config.regularization * np.eye(6)
-        lam = np.linalg.solve(A, r_c)
-
-        # Optional safety clamp for pathological steps.
-        if self.config.max_velocity_error is not None:
-            err_norm = float(np.linalg.norm(c0))
-            if err_norm > self.config.max_velocity_error:
-                lam *= self.config.max_velocity_error / err_norm
-
-        # 6. Apply +J_r^T lambda to the reduced side as a velocity correction
-        #    dv = M_r^-1 J_r^T lambda (the reduced solver already advanced, so the
-        #    impulse is applied as a velocity projection on the output state).
-        tau_boundary = J_r.T @ lam  # generalized impulse on the arm DOFs
-        dv = Minv_r @ tau_boundary
-        qd_out = reduced_state_out.joint_qd.numpy()
-        qd_out[self._reduced_dof0 : self._reduced_dof1] += dv.astype(qd_out.dtype)
-        reduced_state_out.joint_qd.assign(qd_out)
-        # Refresh body_qd so post-step reads see the corrected end-effector twist.
+        # 5. Refresh body_qd so post-step reads see the corrected end-effector twist.
         eval_fk(self.reduced_model, reduced_state_out.joint_q, reduced_state_out.joint_qd, reduced_state_out)
 
-        # 7. Apply -J_m^T lambda to the maximal side as an external wrench at the
-        #    base COM, integrated by the maximal solver's own constraint solve.
-        #    J_m^T performs the boundary -> COM moment transport automatically.
-        f_boundary = -(J_m.T @ lam)  # spatial impulse at base COM (lin, ang), world
-        wrench = f_boundary / dt  # convert impulse to a force over the step
-        bf = maximal_state_in.body_f.numpy()
-        bf[self.maximal_base_body] += wrench.astype(bf.dtype)
-        maximal_state_in.body_f.assign(bf)
+        # 6. Advance the maximal subsystem with the boundary wrench applied.
         self.maximal_solver.step(maximal_state_in, maximal_state_out, maximal_control, maximal_contacts, dt)
 
-        # 8. Diagnostics.
-        v_r_corr = v_r + dv
-        V_e_post = J_r @ v_r_corr
-        # Boundary point is the base COM, so V_b_post is just the base twist.
-        V_b_post = maximal_state_out.body_qd.numpy()[self.maximal_base_body].astype(np.float64)
-        self.boundary_pose_error = e_pose
-        self.boundary_velocity_error_pre = c0
-        self.boundary_velocity_error_post = V_e_post - V_b_post
-        self.boundary_impulse = lam
-        self.boundary_twist_reduced = V_e
-        self.boundary_twist_maximal = V_b
+        # 7. Diagnostics (post-correction boundary velocity error).
+        wp.launch(
+            _post_diag_kernel,
+            dim=1,
+            inputs=[
+                self._reduced_dof0,
+                self._reduced_ndof,
+                self.maximal_base_body,
+                self._Jr,
+                reduced_state_out.joint_qd,
+                maximal_state_out.body_qd,
+            ],
+            outputs=[self._d_velpost],
+            device=self.device,
+        )
+        self._stepped = True
+
+    # -- diagnostics (read by examples/tests; host copies, do not call under capture) --
+
+    @property
+    def boundary_pose_error(self):
+        """Boundary pose error ``(lin, ang)`` in world axes [m, rad], shape ``(6,)``."""
+        return self._d_pose.numpy() if self._stepped else None
+
+    @property
+    def boundary_velocity_error_pre(self):
+        """Pre-correction boundary velocity mismatch ``V_e - V_b``, shape ``(6,)``."""
+        return self._d_c0.numpy() if self._stepped else None
+
+    @property
+    def boundary_velocity_error_post(self):
+        """Post-correction boundary velocity mismatch, shape ``(6,)``."""
+        return self._d_velpost.numpy() if self._stepped else None
+
+    @property
+    def boundary_impulse(self):
+        """Boundary impulse ``lambda`` ``(lin, ang)`` at the boundary point, shape ``(6,)``."""
+        return self._d_lam.numpy() if self._stepped else None
+
+    @property
+    def boundary_twist_reduced(self):
+        """Reduced boundary twist ``V_e`` before correction, shape ``(6,)``."""
+        return self._d_Ve.numpy() if self._stepped else None
+
+    @property
+    def boundary_twist_maximal(self):
+        """Maximal boundary twist ``V_b`` before the maximal advance, shape ``(6,)``."""
+        return self._d_Vb.numpy() if self._stepped else None
 
     def notify_model_changed(self, flags: int) -> None:
         """Forward change notifications to both child solvers."""
