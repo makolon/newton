@@ -118,6 +118,22 @@ handled *inside* each subsystem's own solver, untouched.
   carry meaningful mass (the gripper's main `base` link, not a massless mounting
   frame). A configuration-aware effective inertia (e.g. an empirical probe of the
   maximal solver's boundary response) is the right longer-term fix — see §11.
+* **Clamped graceful degradation under dynamic overload.** Because `Mₘ`
+  under-estimates the loaded effective inertia, the staggered impulse cannot hold
+  the weld through a *dynamic* grasp (lifting/placing a payload, §10): the maximal
+  side under-responds to the wrench the boundary solve predicts, so the Baumgarte
+  bias winds up and ramps the boundary force, and near an arm singularity the
+  reduced operational inverse-inertia amplifies even a small impulse into a
+  joint-velocity whip on the arm. Three optional caps bound this so the failure
+  mode stays *graceful under-correction* rather than a destructive transient: a
+  maximal-side wrench cap (`max_boundary_force` / `max_boundary_torque`) bounds the
+  force/torque exchanged at the seam — and, by Newton's third law, the reaction
+  onto the arm — and a reduced-correction cap (`max_reduced_correction`) bounds the
+  per-step arm velocity correction directly. On the Franka + 2F-85 cube-stacking
+  example these cut the peak arm joint speed from ~25 to ~1 rad/s and the peak
+  boundary force from ~310 to ~50 N while the weld stays sub-degree and
+  sub-millimetre. They are caps, not a cure; the configuration-aware effective
+  inertia of §11 is the real fix.
 * **Velocity-level constraint with optional Baumgarte position stabilization.**
   The default is a small Baumgarte term; pure velocity-level coupling is the
   `baumgarte = 0` special case.

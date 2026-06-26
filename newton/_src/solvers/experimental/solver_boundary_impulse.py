@@ -143,6 +143,10 @@ def _boundary_solve_kernel(
     beta: float,
     reg: float,
     maxvel: float,
+    biasmax: float,
+    fmax: float,
+    tmax: float,
+    dvmax: float,
     base_inv_mass: float,
     ee_com_local: wp.vec3,
     base_com_local: wp.vec3,
@@ -230,8 +234,27 @@ def _boundary_solve_kernel(
     bgain = float(0.0)
     if beta != 0.0:
         bgain = beta / dt
-    for k in range(6):
-        vec6[k] = bgain * d_pose[k] - d_c0[k]
+    # Clamp the Baumgarte bias velocity (linear and angular norms, separately) so a
+    # transient pose-error spike cannot demand a huge corrective boundary velocity.
+    # The (beta/dt) gain is large at a small substep dt, so an un-clamped bias turns a
+    # brief weld-error transient (e.g. a contact event during a dynamic grasp) into a
+    # destructive impulse. Clamping bounds the position-stabilization authority to a
+    # physical correction rate; the velocity-matching term -c0 is left untouched.
+    bias_l = wp.vec3(bgain * d_pose[0], bgain * d_pose[1], bgain * d_pose[2])
+    bias_a = wp.vec3(bgain * d_pose[3], bgain * d_pose[4], bgain * d_pose[5])
+    if biasmax >= 0.0:
+        nl = wp.length(bias_l)
+        if nl > biasmax:
+            bias_l = bias_l * (biasmax / nl)
+        na = wp.length(bias_a)
+        if na > biasmax:
+            bias_a = bias_a * (biasmax / na)
+    vec6[0] = bias_l[0] - d_c0[0]
+    vec6[1] = bias_l[1] - d_c0[1]
+    vec6[2] = bias_l[2] - d_c0[2]
+    vec6[3] = bias_a[0] - d_c0[3]
+    vec6[4] = bias_a[1] - d_c0[4]
+    vec6[5] = bias_a[2] - d_c0[5]
 
     # A = J_r M_r^-1 J_r^T + M_m^-1 (+ reg I).  Solve M_r X = J_r^T first.
     _chol_factor(ndof, H_slice, Lr)
@@ -272,22 +295,93 @@ def _boundary_solve_kernel(
             f = maxvel / cn
             for k in range(6):
                 vec6[k] = vec6[k] * f
+
+    # Wrench clamp: bound the maximal-side boundary force/torque -- and, by Newton's
+    # third law, the reduced-side reaction -- so a dynamic overload (a poorly held
+    # weld whose impulse winds up, or a contact transient) under-corrects rather than
+    # transmitting a destructive impulse to the arm. lambda is an impulse, so the
+    # wrench is lambda/dt; |lambda_lin| <= fmax*dt and |lambda_ang| <= tmax*dt.
+    if fmax >= 0.0:
+        fn = wp.sqrt(vec6[0] * vec6[0] + vec6[1] * vec6[1] + vec6[2] * vec6[2])
+        flim = fmax * dt
+        if fn > flim:
+            s = flim / fn
+            vec6[0] = vec6[0] * s
+            vec6[1] = vec6[1] * s
+            vec6[2] = vec6[2] * s
+    if tmax >= 0.0:
+        tn = wp.sqrt(vec6[3] * vec6[3] + vec6[4] * vec6[4] + vec6[5] * vec6[5])
+        tlim = tmax * dt
+        if tn > tlim:
+            s = tlim / tn
+            vec6[3] = vec6[3] * s
+            vec6[4] = vec6[4] * s
+            vec6[5] = vec6[5] * s
     for k in range(6):
         d_lam[k] = vec6[k]
 
-    # Apply +J_r^T lambda to the reduced side as dv = M_r^-1 J_r^T lambda = X lambda.
+    # Reduced velocity correction dv = M_r^-1 J_r^T lambda = X lambda.
     for i in range(ndof):
         s = float(0.0)
         for q in range(6):
             s = s + X[i, q] * vec6[q]
         dv[i] = s
-        joint_qd[dof0 + i] = joint_qd[dof0 + i] + s
+    # Clamp the reduced velocity correction norm. Near an arm singularity the
+    # operational inverse-inertia X = M_r^-1 J_r^T amplifies even a wrench-bounded
+    # boundary impulse into a large joint-velocity kick; under the staggered scheme
+    # this can resonate into a whip. Bounding |dv| directly caps the disturbance the
+    # coupling injects into the arm, independent of the arm configuration.
+    if dvmax >= 0.0:
+        dn = float(0.0)
+        for i in range(ndof):
+            dn = dn + dv[i] * dv[i]
+        dn = wp.sqrt(dn)
+        if dn > dvmax:
+            sc = dvmax / dn
+            for i in range(ndof):
+                dv[i] = dv[i] * sc
+    for i in range(ndof):
+        joint_qd[dof0 + i] = joint_qd[dof0 + i] + dv[i]
 
     # Apply -J_m^T lambda (= -lambda, J_m = I) to the maximal side as an external
     # wrench at the base COM (impulse / dt).
     fb = body_f_max[base]
     body_f_max[base] = fb + wp.spatial_vector(
         -vec6[0] / dt, -vec6[1] / dt, -vec6[2] / dt, -vec6[3] / dt, -vec6[4] / dt, -vec6[5] / dt
+    )
+
+
+@wp.kernel
+def _weld_project_kernel(
+    dof0: int,
+    ndof: int,
+    base: int,
+    gamma: float,
+    Jr: wp.array2d[float],
+    joint_qd: wp.array[float],
+    new_twist: wp.array[float],  # scratch [6]
+    # in/out
+    body_qd_max: wp.array[wp.spatial_vector],
+):
+    """Velocity-Baumgarte weld: pull the maximal base twist toward the reduced
+    boundary twist ``V_e = J_r v_r`` (at the base COM) by a fraction ``gamma``.
+
+    The boundary impulse alone cannot rigidly weld the angular DOFs: a staggered
+    impulse needs the base's tiny *free* (impulse-response) inertia as ``M_m``, so
+    the angular impulse is negligible and the welded base wobbles under a payload
+    torque. Projecting the base twist onto the constraint after the maximal solve
+    enforces the velocity-level weld directly, independent of the ``M_m`` estimate
+    (it is dissipative -- it only removes the spurious relative twist -- so it adds
+    no overshoot, while the impulse still carries the momentum reaction to the arm).
+    """
+    qd_b = body_qd_max[base]
+    for row in range(6):
+        t = float(0.0)
+        for c in range(ndof):
+            t = t + Jr[row, c] * joint_qd[dof0 + c]
+        new_twist[row] = qd_b[row] + gamma * (t - qd_b[row])
+    body_qd_max[base] = wp.spatial_vector(
+        new_twist[0], new_twist[1], new_twist[2], new_twist[3], new_twist[4], new_twist[5]
     )
 
 
@@ -357,6 +451,44 @@ class SolverBoundaryImpulse(SolverBase):
             max_velocity_error: If the pre-correction boundary velocity error
                 norm exceeds this, the impulse is clamped to avoid blow-up in
                 pathological steps. ``None`` disables clamping.
+            weld_velocity_projection: Velocity-Baumgarte weld gain in ``[0, 1]``.
+                After the maximal advance, the base twist is pulled a fraction
+                ``weld_velocity_projection`` of the way toward the reduced
+                boundary twist, directly enforcing the velocity-level weld
+                independent of the (necessarily approximate) maximal inertia
+                ``M_m``. ``0`` reproduces the pure impulse coupling; ``1`` hard-
+                matches the base twist to the end-effector each step. Use a
+                non-zero value when the maximal subsystem carries a payload whose
+                effective inertia (especially rotational) far exceeds the base
+                body's free inertia, so the angular impulse alone cannot hold the
+                weld (e.g. a gripper grasping an object).
+            baumgarte_max_velocity: Cap on the Baumgarte position-stabilization
+                bias velocity [m/s and rad/s], applied to the linear and angular
+                parts separately. The bias is ``(baumgarte / dt) * pose_error``;
+                at a small substep ``dt`` this gain is large, so a transient pose
+                spike (e.g. a contact event during a dynamic grasp) otherwise
+                demands an enormous corrective boundary velocity that the staggered
+                impulse turns into a destructive kick. Bounding it keeps the
+                position correction at a physical rate while leaving the
+                velocity-matching term unaffected. ``None`` disables the cap.
+            max_boundary_force: Cap on the magnitude of the boundary force [N]
+                exchanged at the seam (and thus, by Newton's third law, the
+                reaction transmitted to the reduced arm). When the weld is poorly
+                held under a dynamic load -- the maximal Schur block ``M_m`` is the
+                base's free inertia and under-estimates the loaded effective
+                inertia, so the impulse can wind up -- this bounds the transmitted
+                wrench so the coupling under-corrects (the design's stable failure
+                mode) instead of destroying the arm. ``None`` disables the cap.
+            max_boundary_torque: Cap on the magnitude of the boundary torque
+                [N·m] exchanged at the seam, the angular counterpart of
+                ``max_boundary_force``. ``None`` disables the cap.
+            max_reduced_correction: Cap on the norm of the per-step reduced
+                generalized velocity correction ``dv = M_r^-1 J_r^T lambda``
+                [m/s or rad/s, joint space]. Near an arm singularity the
+                operational inverse-inertia amplifies even a wrench-bounded impulse
+                into a large joint-velocity kick that can resonate into a whip;
+                this bounds the disturbance injected into the arm directly,
+                independent of the arm configuration. ``None`` disables the cap.
         """
 
         def __init__(
@@ -364,10 +496,20 @@ class SolverBoundaryImpulse(SolverBase):
             baumgarte: float = 0.2,
             regularization: float = 1.0e-6,
             max_velocity_error: float | None = 1.0e3,
+            weld_velocity_projection: float = 0.0,
+            baumgarte_max_velocity: float | None = None,
+            max_boundary_force: float | None = None,
+            max_boundary_torque: float | None = None,
+            max_reduced_correction: float | None = None,
         ):
             self.baumgarte = baumgarte
             self.regularization = regularization
             self.max_velocity_error = max_velocity_error
+            self.weld_velocity_projection = weld_velocity_projection
+            self.baumgarte_max_velocity = baumgarte_max_velocity
+            self.max_boundary_force = max_boundary_force
+            self.max_boundary_torque = max_boundary_torque
+            self.max_reduced_correction = max_reduced_correction
 
     def __init__(
         self,
@@ -481,6 +623,7 @@ class SolverBoundaryImpulse(SolverBase):
         self._d_Ve = z(6)
         self._d_Vb = z(6)
         self._d_velpost = z(6)
+        self._proj_twist = z(6)  # scratch for the velocity-Baumgarte weld projection
 
     # -- the coupled step ---------------------------------------------------
 
@@ -551,6 +694,10 @@ class SolverBoundaryImpulse(SolverBase):
         #    body_f. The boundary point is anchored at the maximal base COM, so the
         #    maximal Jacobian is the identity selection (J_m = I).
         maxvel = -1.0 if self.config.max_velocity_error is None else float(self.config.max_velocity_error)
+        biasmax = -1.0 if self.config.baumgarte_max_velocity is None else float(self.config.baumgarte_max_velocity)
+        fmax = -1.0 if self.config.max_boundary_force is None else float(self.config.max_boundary_force)
+        tmax = -1.0 if self.config.max_boundary_torque is None else float(self.config.max_boundary_torque)
+        dvmax = -1.0 if self.config.max_reduced_correction is None else float(self.config.max_reduced_correction)
         wp.launch(
             _boundary_solve_kernel,
             dim=1,
@@ -564,6 +711,10 @@ class SolverBoundaryImpulse(SolverBase):
                 float(self.config.baumgarte),
                 float(self.config.regularization),
                 maxvel,
+                biasmax,
+                fmax,
+                tmax,
+                dvmax,
                 self._base_inv_mass,
                 self._ee_com_local,
                 self._base_com_local,
@@ -599,6 +750,27 @@ class SolverBoundaryImpulse(SolverBase):
 
         # 6. Advance the maximal subsystem with the boundary wrench applied.
         self.maximal_solver.step(maximal_state_in, maximal_state_out, maximal_control, maximal_contacts, dt)
+
+        # 6b. Velocity-Baumgarte weld: pull the advanced base twist toward the
+        #     reduced boundary twist. Enforces the velocity weld directly (the
+        #     impulse alone cannot weld the angular DOFs under a payload torque).
+        gamma = float(self.config.weld_velocity_projection)
+        if gamma != 0.0:
+            wp.launch(
+                _weld_project_kernel,
+                dim=1,
+                inputs=[
+                    self._reduced_dof0,
+                    self._reduced_ndof,
+                    self.maximal_base_body,
+                    gamma,
+                    self._Jr,
+                    reduced_state_out.joint_qd,
+                    self._proj_twist,
+                    maximal_state_out.body_qd,
+                ],
+                device=self.device,
+            )
 
         # 7. Diagnostics (post-correction boundary velocity error).
         wp.launch(
