@@ -117,7 +117,21 @@ handled *inside* each subsystem's own solver, untouched.
   stabilization). The practical consequence is that the chosen base body should
   carry meaningful mass (the gripper's main `base` link, not a massless mounting
   frame). A configuration-aware effective inertia (e.g. an empirical probe of the
-  maximal solver's boundary response) is the right longer-term fix — see §11.
+  maximal solver's boundary response) is the right longer-term fix — see §11 — and
+  is now available as an opt-in (`Config.use_effective_inertia`, below).
+* **Optional probed effective inertia (`use_effective_inertia`).** Instead of the
+  free-base under-estimate, the maximal Schur block can be the *exact* effective
+  inverse spatial inertia of the whole maximal subsystem at the base — loop
+  closure, payload, and current contacts included — measured empirically once per
+  frame. A separate cold-probe maximal solver applies six unit boundary impulses
+  `e_k` at the base and reads the base-twist response, assembling the 6×6 operator
+  `Aₘ_eff` (symmetrized, with an SPD fallback to the free-base block). On the
+  Franka + 2F-85 example the probed angular block is ~3–4× larger than the
+  free-base estimate (the root cause of the weak angular weld), so the impulse
+  itself holds the weld: the angular pose error stays ~1.3° *even with the
+  velocity-Baumgarte stabilization turned off*, versus needing the crutch before.
+  The probe runs entirely on-device (its seven Kamino solves are wrapped in their
+  own CUDA graph) for ~15–18 % added gripper cost. See `probe_maximal_inertia()`.
 * **Clamped graceful degradation under dynamic overload.** Because `Mₘ`
   under-estimates the loaded effective inertia, the staggered impulse cannot hold
   the weld through a *dynamic* grasp (lifting/placing a payload, §10): the maximal

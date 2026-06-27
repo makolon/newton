@@ -106,6 +106,68 @@ def _rotation_log(R: wp.mat33) -> wp.vec3:
     return axis * (theta / (2.0 * wp.sin(theta)))
 
 
+# ---------------------------------------------------------------------------
+# Effective-inertia probe kernels. To replace the free-base M_m with the exact
+# loaded effective inverse inertia, we apply unit boundary impulses at the base
+# and read the maximal solver's twist response (a Delassus probe). All run with
+# dim=1 and are CUDA-graph capturable, so the per-frame probe stays on-device.
+# ---------------------------------------------------------------------------
+
+
+@wp.kernel
+def _probe_set_wrench_kernel(base: int, k: int, scale: float, body_f: wp.array[wp.spatial_vector]):
+    """Set ``body_f[base]`` to a unit wrench along axis ``k`` (held over dt -> impulse)."""
+    body_f[base] = wp.spatial_vector(
+        wp.where(k == 0, scale, 0.0),
+        wp.where(k == 1, scale, 0.0),
+        wp.where(k == 2, scale, 0.0),
+        wp.where(k == 3, scale, 0.0),
+        wp.where(k == 4, scale, 0.0),
+        wp.where(k == 5, scale, 0.0),
+    )
+
+
+@wp.kernel
+def _probe_baseline_kernel(base: int, qd: wp.array[wp.spatial_vector], V0: wp.array[float]):
+    """Record the base twist with no boundary wrench (gravity/PD/Coriolis/contact bias)."""
+    v = qd[base]
+    for r in range(6):
+        V0[r] = v[r]
+
+
+@wp.kernel
+def _probe_accum_kernel(
+    base: int,
+    k: int,
+    inv_impulse: float,
+    qd: wp.array[wp.spatial_vector],
+    V0: wp.array[float],
+    A_m_eff: wp.array2d[float],
+    probe_ok: wp.array[wp.int32],
+):
+    """Column ``k`` of the effective inverse inertia: (V_b(e_k) - V_b(0)) / impulse."""
+    if k == 0:
+        probe_ok[0] = 1
+    v = qd[base]
+    for r in range(6):
+        c = (v[r] - V0[r]) * inv_impulse
+        if wp.isnan(c) or wp.isinf(c):
+            probe_ok[0] = 0
+        A_m_eff[r, k] = c
+
+
+@wp.kernel
+def _probe_symmetrize_kernel(floor: float, A_m_eff: wp.array2d[float]):
+    """Symmetrize the probed operator (PADMM/contact asymmetry) and add a SPD floor."""
+    for p in range(6):
+        for q in range(p + 1, 6):
+            m = 0.5 * (A_m_eff[p, q] + A_m_eff[q, p])
+            A_m_eff[p, q] = m
+            A_m_eff[q, p] = m
+    for d in range(6):
+        A_m_eff[d, d] = A_m_eff[d, d] + floor
+
+
 @wp.kernel
 def _capture_weld_kernel(
     ee: int,
@@ -178,6 +240,10 @@ def _boundary_solve_kernel(
     d_lam: wp.array[float],
     d_Ve: wp.array[float],
     d_Vb: wp.array[float],
+    # probed effective inertia (used iff use_eff != 0 and probe_ok[0] == 1)
+    use_eff: int,
+    probe_ok: wp.array[wp.int32],
+    A_m_eff: wp.array2d[float],
 ):
     # Single-thread solve (launched with dim=1); the boundary system is tiny.
 
@@ -271,13 +337,19 @@ def _boundary_solve_kernel(
                 s = s + Jr[p, i] * X[i, q]
             A[p, q] = s
 
-    # Maximal inverse spatial inertia at the base COM (world), block-diagonal.
-    # The base's free-body inertia is an intentional under-estimate (see note).
-    Iinv = R_base * base_inv_inertia_local * wp.transpose(R_base)
-    for i in range(3):
-        A[i, i] = A[i, i] + base_inv_mass
-        for j in range(3):
-            A[3 + i, 3 + j] = A[3 + i, 3 + j] + Iinv[i, j]
+    # Maximal inverse spatial inertia at the base COM (world axes). With a valid
+    # probe, use the exact effective operator (loop closure + contacts), already
+    # symmetrized; otherwise fall back to the free-body under-estimate.
+    if use_eff != 0 and probe_ok[0] == 1:
+        for p in range(6):
+            for q in range(6):
+                A[p, q] = A[p, q] + A_m_eff[p, q]
+    else:
+        Iinv = R_base * base_inv_inertia_local * wp.transpose(R_base)
+        for i in range(3):
+            A[i, i] = A[i, i] + base_inv_mass
+            for j in range(3):
+                A[3 + i, 3 + j] = A[3 + i, 3 + j] + Iinv[i, j]
     for k in range(6):
         A[k, k] = A[k, k] + reg
 
@@ -489,6 +561,21 @@ class SolverBoundaryImpulse(SolverBase):
                 into a large joint-velocity kick that can resonate into a whip;
                 this bounds the disturbance injected into the arm directly,
                 independent of the arm configuration. ``None`` disables the cap.
+            use_effective_inertia: Replace the free-body maximal Schur block
+                ``M_m^-1`` with the *empirically probed* effective inverse spatial
+                inertia of the whole maximal subsystem at the base body (loop
+                closure + current contacts). This removes the free-base
+                under-estimate that drives under-correction / windup / weld drift.
+                Requires a ``probe_solver`` and a per-step call to
+                :meth:`probe_maximal_inertia` (typically once per frame). ``False``
+                reproduces the free-base approximation exactly.
+            probe_impulse: Magnitude of the unit test impulses used by the probe
+                [N·s / N·m·s]. Small enough not to switch the maximal contact set,
+                large enough to stay above solver noise. Only used when
+                ``use_effective_inertia`` is set.
+            probe_regularization: Diagonal floor added to the probed effective
+                inverse inertia for SPD robustness [kg^-1-ish]. ``0`` relies on the
+                always-SPD reduced block plus ``regularization``.
         """
 
         def __init__(
@@ -501,6 +588,9 @@ class SolverBoundaryImpulse(SolverBase):
             max_boundary_force: float | None = None,
             max_boundary_torque: float | None = None,
             max_reduced_correction: float | None = None,
+            use_effective_inertia: bool = False,
+            probe_impulse: float = 1.0,
+            probe_regularization: float = 0.0,
         ):
             self.baumgarte = baumgarte
             self.regularization = regularization
@@ -510,6 +600,9 @@ class SolverBoundaryImpulse(SolverBase):
             self.max_boundary_force = max_boundary_force
             self.max_boundary_torque = max_boundary_torque
             self.max_reduced_correction = max_reduced_correction
+            self.use_effective_inertia = use_effective_inertia
+            self.probe_impulse = probe_impulse
+            self.probe_regularization = probe_regularization
 
     def __init__(
         self,
@@ -518,6 +611,7 @@ class SolverBoundaryImpulse(SolverBase):
         reduced_ee_body: int,
         maximal_base_body: int,
         config: Config | None = None,
+        probe_solver: SolverBase | None = None,
     ):
         # The base class only needs *a* model for .device etc.; the reduced model
         # is the natural choice. We keep explicit references to both subsystems.
@@ -525,6 +619,10 @@ class SolverBoundaryImpulse(SolverBase):
 
         self.reduced_solver = reduced_solver
         self.maximal_solver = maximal_solver
+        # A separate maximal solver (cold-start configured) used only by
+        # probe_maximal_inertia to measure the effective inverse inertia without
+        # perturbing the production maximal solver. Required iff use_effective_inertia.
+        self._probe_solver = probe_solver
         self.reduced_model = reduced_solver.model
         self.maximal_model = maximal_solver.model
         self.reduced_ee_body = int(reduced_ee_body)
@@ -571,6 +669,19 @@ class SolverBoundaryImpulse(SolverBase):
 
         self._stepped = False
         self._alloc_scratch()
+
+        # Effective-inertia probe state (only when enabled).
+        if self.config.use_effective_inertia:
+            if probe_solver is None:
+                raise ValueError(
+                    "use_effective_inertia=True requires probe_solver (a separate maximal solver "
+                    "configured for a clean cold-start probe of the boundary effective inertia)."
+                )
+            # Probe states come from the PROBE solver's own model (an identical
+            # clone of the maximal model) so their Kamino State schema matches it.
+            self._probe_in = self._probe_solver.model.state()
+            self._probe_out = self._probe_solver.model.state()
+            self._probe_V0 = wp.zeros(6, dtype=float, device=self.device)
 
     # -- setup helpers ------------------------------------------------------
 
@@ -624,6 +735,11 @@ class SolverBoundaryImpulse(SolverBase):
         self._d_Vb = z(6)
         self._d_velpost = z(6)
         self._proj_twist = z(6)  # scratch for the velocity-Baumgarte weld projection
+        # Probed maximal effective inverse inertia (impulse->twist) + validity flag.
+        # Always allocated so the boundary kernel signature is fixed; only written
+        # (and consumed) when config.use_effective_inertia is set.
+        self._A_m_eff = z(6, 6)
+        self._probe_ok = wp.zeros(1, dtype=wp.int32, device=dev)
 
     # -- the coupled step ---------------------------------------------------
 
@@ -741,6 +857,9 @@ class SolverBoundaryImpulse(SolverBase):
                 self._d_lam,
                 self._d_Ve,
                 self._d_Vb,
+                1 if self.config.use_effective_inertia else 0,
+                self._probe_ok,
+                self._A_m_eff,
             ],
             device=self.device,
         )
@@ -788,6 +907,88 @@ class SolverBoundaryImpulse(SolverBase):
             device=self.device,
         )
         self._stepped = True
+
+    # -- effective-inertia probe -------------------------------------------
+
+    def _load_probe_config(self, src: State) -> None:
+        """Copy the kinematic configuration (not the Kamino dual/warm-start state)
+        from ``src`` into the probe input.
+
+        We deliberately copy only ``body_q/body_qd`` (and the joint coordinates) and
+        not the full state: Kamino's ``joint_lambdas`` is a per-solver dual seed that
+        is sized lazily (it grows once contacts are detected), so the probe model's
+        layout differs from the production gripper's. The probe measures the wrench
+        *response* relative to a baseline, so the warm-start seed cancels out; the
+        probe solver computes its own dual state from the copied configuration.
+        """
+        dst = self._probe_in
+        wp.copy(dst.body_q, src.body_q)
+        wp.copy(dst.body_qd, src.body_qd)
+        if dst.joint_q is not None and src.joint_q is not None:
+            wp.copy(dst.joint_q, src.joint_q)
+        if dst.joint_qd is not None and src.joint_qd is not None:
+            wp.copy(dst.joint_qd, src.joint_qd)
+
+    def probe_maximal_inertia(
+        self,
+        maximal_state: State,
+        maximal_control: Control | None,
+        maximal_contacts: Contacts | None,
+        dt: float,
+    ) -> None:
+        """Measure the maximal subsystem's effective inverse inertia at the base body.
+
+        Applies the unit boundary impulses ``probe_impulse * e_k`` (k=0..5) at the
+        base via the cold-start ``probe_solver`` and reads the base-twist response,
+        writing the 6x6 operator ``A_m_eff`` (impulse->twist) consumed by the next
+        :meth:`step` calls. Call once at the start of each frame on the
+        ``maximal_state`` that the frame's substeps will start from; the result is
+        cached and reused for every substep. The seven solves run entirely on-device,
+        so the caller can wrap this in its own CUDA graph (see the example).
+
+        Requires ``config.use_effective_inertia`` and a ``probe_solver``.
+        """
+        base = self.maximal_base_body
+        impulse = float(self.config.probe_impulse)
+        wrench = impulse / dt  # held over dt -> delivered impulse == probe_impulse
+
+        # Baseline: zero boundary wrench (absorbs gravity / PD / Coriolis / contact bias).
+        self._load_probe_config(maximal_state)
+        self._probe_in.clear_forces()
+        self._probe_solver.step(self._probe_in, self._probe_out, maximal_control, maximal_contacts, dt)
+        wp.launch(
+            _probe_baseline_kernel,
+            dim=1,
+            inputs=[base, self._probe_out.body_qd, self._probe_V0],
+            device=self.device,
+        )
+
+        # Six unit columns. The loop unrolls under capture to a fixed kernel/step
+        # sequence; each column re-copies the same input config (step round-trips
+        # body_q in place) so all probes detect the identical contact set.
+        for k in range(6):
+            self._probe_in.assign(maximal_state)
+            self._probe_in.clear_forces()
+            wp.launch(
+                _probe_set_wrench_kernel,
+                dim=1,
+                inputs=[base, k, wrench, self._probe_in.body_f],
+                device=self.device,
+            )
+            self._probe_solver.step(self._probe_in, self._probe_out, maximal_control, maximal_contacts, dt)
+            wp.launch(
+                _probe_accum_kernel,
+                dim=1,
+                inputs=[base, k, 1.0 / impulse, self._probe_out.body_qd, self._probe_V0, self._A_m_eff, self._probe_ok],
+                device=self.device,
+            )
+
+        wp.launch(
+            _probe_symmetrize_kernel,
+            dim=1,
+            inputs=[float(self.config.probe_regularization), self._A_m_eff],
+            device=self.device,
+        )
 
     # -- diagnostics (read by examples/tests; host copies, do not call under capture) --
 

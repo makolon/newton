@@ -235,6 +235,7 @@ class Example:
         self.use_graph = wp.get_device().is_cuda and not getattr(args, "no_graph", False)
         assert not self.use_graph or self.sim_substeps % 2 == 0, "graph capture needs an even sim_substeps"
         self._graph = None
+        self._probe_graph = None  # captured per-frame effective-inertia probe (hybrid only)
         # Set by _make_kamino_solver; mujoco uses Newton contacts (model.collide).
         self._kamino_internal = False
 
@@ -427,6 +428,28 @@ class Example:
         if mj is not None and getattr(mj, "ctrl_source", None) is not None:
             mj.ctrl_source.fill_(int(newton.solvers.SolverMuJoCo.CtrlSource.JOINT_TARGET))
 
+    def _regularize_massless_bodies(self, model, mass=0.5):
+        """Give massless link frames a small mass so their constraints are well-posed
+        in SolverKamino's maximal-coordinate solve.
+
+        The Franka URDF carries massless frames (e.g. ``fr3/base``, ``fr3_link8``). A
+        body with ``inv_mass == 0`` makes any constraint touching it (here the
+        fixed-base world-anchor weld) singular in Kamino's Delassus operator, so the
+        weld applies no force and the rigid arm free-falls at gravity. A small
+        regularizing mass/inertia makes the weld well-posed and anchors the arm; the
+        value is tiny next to the arm's links, and the regularized frames barely move,
+        so the dynamics are essentially unchanged.
+        """
+        invm = model.body_inv_mass.numpy()
+        invi = model.body_inv_inertia.numpy()
+        massless = ~np.isfinite(invm) | (invm == 0.0)
+        if not massless.any():
+            return
+        invm[massless] = 1.0 / mass
+        invi[massless] = np.eye(3, dtype=invi.dtype) * (1.0 / (mass * 1.0e-3))
+        model.body_inv_mass.assign(invm)
+        model.body_inv_inertia.assign(invi)
+
     def _make_kamino_solver(self, model):
         """Build a SolverKamino using its own UNIFIED collision pipeline.
 
@@ -442,6 +465,16 @@ class Example:
         cfg.collision_detector.pipeline = "unified"
         cfg.collision_detector.max_contacts = 1024
         return newton.solvers.SolverKamino(model, cfg)
+
+    def _make_probe_solver(self, model):
+        """A SECOND Kamino over the same gripper model, used only by
+        SolverBoundaryImpulse to probe the boundary effective inertia. It is a
+        separate solver instance, so its warm-start caches are isolated from the
+        production gripper solver and the probe cannot perturb it. It keeps the same
+        config (incl. the default ``containers`` warm-start) as the production solver
+        so its State schema matches ``grip_0`` (a ``none`` warm-start would allocate a
+        different State layout and break the per-frame ``State.assign``)."""
+        return self._make_kamino_solver(model)
 
     def _build_solver(self):
         if self.solver_kind == "mujoco":
@@ -459,6 +492,11 @@ class Example:
                 use_mujoco_contacts=False,
             )
         elif self.solver_kind == "kamino":
+            # Full-Kamino runs the FIXED-base arm in maximal coordinates, where the
+            # massless URDF frames would make the world-anchor weld singular (the arm
+            # free-falls). Regularize them so the anchor holds. (The hybrid's gripper
+            # is floating, so it has no world-anchor and is left untouched.)
+            self._regularize_massless_bodies(self.model)
             self.solver = self._make_kamino_solver(self.model)
         else:
             raise ValueError(f"solver '{self.solver_kind}' is built in the hybrid subclass")
@@ -759,21 +797,49 @@ class HybridExample(Example):
         # lift/place transitions: the Baumgarte bias winds up (the maximal side
         # under-responds to the wrench it predicts), ramping the boundary force, and
         # near arm singularities the operational inverse-inertia amplifies even a
-        # small impulse into a joint-velocity whip on the arm. The clamps below bound
-        # the transmitted wrench (so the gripper is not blasted) and the arm velocity
-        # correction (so the arm is not whipped), turning the dynamic overload into a
-        # graceful under-correction instead of a destructive transient (peak arm
-        # joint speed ~25 -> ~1 rad/s, peak boundary force ~310 -> ~50 N).
+        # small impulse into a joint-velocity whip on the arm.
+        #
+        # The arm whip is bounded by ``max_reduced_correction`` (the per-step arm
+        # velocity correction) -- that is what protects the reduced side from being
+        # destroyed. The boundary *force* cap is deliberately generous: the gripper
+        # base is welded and damped, so it tolerates the few-hundred-newton reaction
+        # of the stiff arm pressing the cube onto the stack during a place. Capping
+        # that force too tightly does NOT help arm safety (the correction cap already
+        # does), and instead starves the weld so it sinks under the place push -- the
+        # soft velocity+Baumgarte weld then holds a steady-state position error and
+        # the gripper visibly penetrates the arm (a ~50 N cap left ~24 mm of seam
+        # drift; ~600 N keeps it sub-millimetre during the place). A true fix for the
+        # residual drift is a position-level seam constraint (see the design note).
+        #
+        # use_effective_inertia replaces the free-base M_m (the root approximation
+        # that under-states the loaded gripper inertia and drives under-correction)
+        # with the EXACT loaded effective inverse inertia, probed each frame on a
+        # cold-start Kamino. With the correctly-sized maximal block the impulse holds
+        # the weld on its own, so the velocity-projection/force-cap crutches can be
+        # relaxed and the seam stays tight without winding up (~+17% gripper cost).
+        # The probe needs its own gripper model: a second Kamino solver on the same
+        # model re-sizes the shared Kamino State schema (joint_lambdas), breaking the
+        # per-frame State.assign. build_gripper_cubes is deterministic (fixed RNG), so
+        # this clone is body-for-body identical to grip_model and its state layout
+        # matches grip_0.
+        self._probe_model = self.build_gripper_cubes(flange_tf).finalize(device=device, skip_validation_joints=True)
+        self._probe_solver = self._make_probe_solver(self._probe_model)
         self.solver = newton.solvers.SolverBoundaryImpulse(
             reduced_solver=self.arm_solver,
             maximal_solver=self.grip_solver,
             reduced_ee_body=self.arm_flange,
             maximal_base_body=self.grip_base,
+            probe_solver=self._probe_solver,
             config=newton.solvers.SolverBoundaryImpulse.Config(
-                weld_velocity_projection=0.4,
-                max_boundary_force=50.0,
-                max_boundary_torque=10.0,
-                max_reduced_correction=0.1,
+                use_effective_inertia=True,
+                probe_impulse=1.0,
+                # With the probed effective inertia the impulse itself holds the weld
+                # (angular pose error ~1.3 deg peak even at projection 0.0), so this
+                # velocity-Baumgarte crutch is relaxed from 0.4 to a light 0.2.
+                weld_velocity_projection=0.2,
+                max_reduced_correction=0.5,  # bounds the arm whip (~25 -> ~1.5 rad/s)
+                max_boundary_force=600.0,  # generous: hold the place push, not starve the weld
+                max_boundary_torque=60.0,
             ),
         )
 
@@ -896,6 +962,25 @@ class HybridExample(Example):
         self._apply_split_targets()
         if not self._kamino_internal:
             self.grip_model.collide(self.grip_0, self.grip_contacts)
+        if self.solver.config.use_effective_inertia:
+            self._probe()
+
+    def _probe(self):
+        # Probe the boundary effective inertia once per frame on grip_0 (the state the
+        # substeps start from), in its own CUDA graph so the Kamino probe solves stay
+        # on-device. Mirrors simulate()'s warm-then-capture-then-replay; grip_0 is
+        # address-stable here because _run_substeps swaps an even number of times. The
+        # probe is a small fraction of the gripper-Kamino-dominated step cost.
+        args = (self.grip_0, self.grip_ctrl, self.grip_contacts, self.sim_dt)
+        if not self.use_graph:
+            self.solver.probe_maximal_inertia(*args)
+        elif self._probe_graph is None:
+            self.solver.probe_maximal_inertia(*args)  # warm
+            with wp.ScopedCapture() as cap:
+                self.solver.probe_maximal_inertia(*args)
+            self._probe_graph = cap.graph
+        else:
+            wp.capture_launch(self._probe_graph)
 
     def _run_substeps(self):
         for _ in range(self.sim_substeps):

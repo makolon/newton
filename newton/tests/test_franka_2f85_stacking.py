@@ -89,6 +89,31 @@ class TestFranka2f85Stacking(unittest.TestCase):
         self.assertLessEqual(float(np.linalg.norm(ex.solver._dv.numpy())), dvmax * 1.05)
         self.assertTrue(np.all(np.isfinite(ex.arm_0.body_q.numpy())))
 
+    def test_hybrid_effective_inertia_probed(self):
+        """The effective-inertia probe runs on-device under graph capture, yields a
+        finite SPD operator, and captures the loaded angular inertia that the free
+        base under-estimates, so the angular weld stays tight with only the light
+        velocity-Baumgarte crutch."""
+        viewer = newton.viewer.ViewerNull(num_frames=12)
+        ex = make_example(viewer, _args("hybrid"))
+        self.assertTrue(ex.solver.config.use_effective_inertia)
+        for _ in range(8):
+            ex.step()
+
+        self.assertEqual(int(ex.solver._probe_ok.numpy()[0]), 1)
+        A = ex.solver._A_m_eff.numpy()
+        self.assertTrue(np.all(np.isfinite(A)))
+        # Symmetric positive definite: the boundary Cholesky factorization needs it.
+        eig = np.linalg.eigvalsh(0.5 * (A + A.T))
+        self.assertGreater(float(eig.min()), 0.0)
+        # The probe sees the loaded angular inertia: its (rotation-invariant) inverse
+        # trace is markedly below the bare base's -- the root cause of the weak weld.
+        free_ang_tr = float(np.trace(np.asarray(ex.solver._base_inv_inertia_local).reshape(3, 3)))
+        probed_ang_tr = float(np.trace(A[3:, 3:]))
+        self.assertLess(probed_ang_tr, free_ang_tr)
+        # The angular weld stays tight (< 5 deg) with the relaxed crutch.
+        self.assertLess(float(np.linalg.norm(ex.solver.boundary_pose_error[3:])), np.deg2rad(5.0))
+
     def test_kamino_runs_finite(self):
         """The full-Kamino config builds (unified mesh collision) and stays finite."""
         viewer = newton.viewer.ViewerNull(num_frames=12)
